@@ -2,3 +2,6 @@
 *~
 models
 .DS_Store
+dataset_cache
+old_logs
+
