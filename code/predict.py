@@ -1,7 +1,6 @@
 """ This script loads a base classifier and then runs PREDICT on many examples from a dataset.
 """
 import argparse
-import setGPU
 from datasets import get_dataset, DATASETS, get_num_classes
 from core import Smooth
 from time import time
