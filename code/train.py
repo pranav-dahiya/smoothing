@@ -4,16 +4,20 @@
 
 import argparse
 import os
-import torch
-from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader
-from datasets import get_dataset, DATASETS
-from architectures import ARCHITECTURES, get_architecture
-from torch.optim import SGD, Optimizer
-from torch.optim.lr_scheduler import StepLR
 import time
 import datetime
+from typing import Optional
+
+from torch.nn import CrossEntropyLoss
+from torch.utils.data import DataLoader
+from torch.optim import SGD, Optimizer
+from torch.optim.lr_scheduler import StepLR
+
 from train_utils import AverageMeter, accuracy, init_logfile, log
+from datasets import get_dataset, DATASETS
+from architectures import ARCHITECTURES, get_architecture
+from noise import *
+
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('dataset', type=str, choices=DATASETS)
@@ -35,6 +39,8 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--noise', type=str, choices=NOISE_FUNCTIONS.keys(), help="Noise function")
+parser.add_argument('--noise_args', type=float, nargs='+', help='Arguments for noise function')
 parser.add_argument('--noise_sd', default=0.0, type=float,
                     help="standard deviation of Gaussian noise for data augmentation")
 parser.add_argument('--gpu', default=None, type=str,
@@ -61,33 +67,45 @@ def main():
 
     model = get_architecture(args.arch, args.dataset)
 
-    logfilename = os.path.join(args.outdir, 'log.txt')
+    outdir = os.path.join(args.outdir, args.dataset, args.arch, f"{args.noise}_{'_'.join(map(str, args.noise_args))}")
+    os.makedirs(outdir, exist_ok=True)
+    logfilename = os.path.join(outdir, 'log.txt')
     init_logfile(logfilename, "epoch\ttime\tlr\ttrain loss\ttrain acc\ttestloss\ttest acc")
 
     criterion = CrossEntropyLoss().cuda()
     optimizer = SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     scheduler = StepLR(optimizer, step_size=args.lr_step_size, gamma=args.gamma)
 
+    noise_fn = NOISE_FUNCTIONS[args.noise](*args.noise_args)
+
     for epoch in range(args.epochs):
-        scheduler.step(epoch)
         before = time.time()
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, args.noise_sd)
-        test_loss, test_acc = test(test_loader, model, criterion, args.noise_sd)
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, noise_fn, args.noise_sd)
+        test_loss, test_acc = test(test_loader, model, criterion, noise_fn, args.noise_sd)
         after = time.time()
+        scheduler.step()
 
         log(logfilename, "{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}".format(
             epoch, str(datetime.timedelta(seconds=(after - before))),
-            scheduler.get_lr()[0], train_loss, train_acc, test_loss, test_acc))
+            scheduler.get_last_lr()[0], train_loss, train_acc, test_loss, test_acc))
 
         torch.save({
             'epoch': epoch + 1,
             'arch': args.arch,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-        }, os.path.join(args.outdir, 'checkpoint.pth.tar'))
+        }, os.path.join(outdir, 'checkpoint.pth.tar'))
 
 
-def train(loader: DataLoader, model: torch.nn.Module, criterion, optimizer: Optimizer, epoch: int, noise_sd: float):
+def train(
+        loader: DataLoader,
+        model: torch.nn.Module,
+        criterion: torch.nn.Module,
+        optimizer: Optimizer,
+        epoch: int,
+        noise_fn: Optional[Callable[[Size], Tensor]] = None,
+        noise_sd: Optional[float] = 0
+):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -106,7 +124,10 @@ def train(loader: DataLoader, model: torch.nn.Module, criterion, optimizer: Opti
         targets = targets.cuda()
 
         # augment inputs with noise
-        inputs = inputs + torch.randn_like(inputs, device='cuda') * noise_sd
+        if noise_fn:
+            inputs += noise_fn(inputs.size())
+        else:
+            inputs = inputs + torch.randn_like(inputs, device='cuda') * noise_sd
 
         # compute output
         outputs = model(inputs)
@@ -140,7 +161,13 @@ def train(loader: DataLoader, model: torch.nn.Module, criterion, optimizer: Opti
     return (losses.avg, top1.avg)
 
 
-def test(loader: DataLoader, model: torch.nn.Module, criterion, noise_sd: float):
+def test(
+        loader: DataLoader,
+        model: torch.nn.Module,
+        criterion: torch.nn.Module,
+        noise_fn: Optional[Callable] = None,
+        noise_sd: Optional[float] = 0
+):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -160,7 +187,10 @@ def test(loader: DataLoader, model: torch.nn.Module, criterion, noise_sd: float)
             targets = targets.cuda()
 
             # augment inputs with noise
-            inputs = inputs + torch.randn_like(inputs, device='cuda') * noise_sd
+            if noise_fn:
+                inputs += noise_fn(inputs.size())
+            else:
+                inputs = inputs + torch.randn_like(inputs, device='cuda') * noise_sd
 
             # compute output
             outputs = model(inputs)
